@@ -645,6 +645,7 @@ fn proc_macro_span(db: &dyn ExpandDatabase, ast: AstId<ast::Fn>) -> Span {
 
 #[salsa_macros::tracked(returns(ref))]
 fn expand_proc_macro(db: &dyn ExpandDatabase, id: MacroCallId) -> ExpandResult<tt::TopSubtree> {
+    let _p = tracing::info_span!("expand_proc_macro").entered();
     let loc = id.loc(db);
     let (macro_arg, undo_info, span) = db.macro_arg_considering_derives(id, &loc.kind);
 
@@ -687,6 +688,7 @@ pub(crate) fn token_tree_to_syntax_node(
     tt: &tt::TopSubtree,
     expand_to: ExpandTo,
 ) -> (Parse<SyntaxNode>, ExpansionSpanMap) {
+    let _p = tracing::info_span!("token_tree_to_syntax_node").entered();
     let entry_point = match expand_to {
         ExpandTo::Statements => syntax_bridge::TopEntryPoint::MacroStmts,
         ExpandTo::Items => syntax_bridge::TopEntryPoint::MacroItems,

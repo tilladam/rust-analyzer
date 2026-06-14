@@ -2,6 +2,7 @@
 
 #[macro_use]
 mod utils;
+mod slint_bench;
 use utils::*;
 
 use expect_test::expect;

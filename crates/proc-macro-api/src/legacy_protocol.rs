@@ -89,31 +89,38 @@ pub(crate) fn expand(
     let def_site = span_data_table.insert_full(def_site).0;
     let call_site = span_data_table.insert_full(call_site).0;
     let mixed_site = span_data_table.insert_full(mixed_site).0;
-    let task = ExpandMacro {
-        data: ExpandMacroData {
-            macro_body: FlatTree::from_subtree(subtree, version, &mut span_data_table),
-            macro_name: proc_macro.name.to_string(),
-            attributes: attr
-                .map(|subtree| FlatTree::from_subtree(subtree, version, &mut span_data_table)),
-            has_global_spans: ExpnGlobals {
-                serialize: version >= version::HAS_GLOBAL_SPANS,
-                def_site,
-                call_site,
-                mixed_site,
+    let task = {
+        let _p = tracing::info_span!("proc_macro::serialize_request").entered();
+        ExpandMacro {
+            data: ExpandMacroData {
+                macro_body: FlatTree::from_subtree(subtree, version, &mut span_data_table),
+                macro_name: proc_macro.name.to_string(),
+                attributes: attr
+                    .map(|subtree| FlatTree::from_subtree(subtree, version, &mut span_data_table)),
+                has_global_spans: ExpnGlobals {
+                    serialize: version >= version::HAS_GLOBAL_SPANS,
+                    def_site,
+                    call_site,
+                    mixed_site,
+                },
+                span_data_table: if process.rust_analyzer_spans() {
+                    serialize_span_data_index_map(&span_data_table)
+                } else {
+                    Vec::new()
+                },
             },
-            span_data_table: if process.rust_analyzer_spans() {
-                serialize_span_data_index_map(&span_data_table)
-            } else {
-                Vec::new()
-            },
-        },
-        lib: proc_macro.dylib_path.to_path_buf().into(),
-        env,
-        current_dir: Some(current_dir),
+            lib: proc_macro.dylib_path.to_path_buf().into(),
+            env,
+            current_dir: Some(current_dir),
+        }
     };
 
-    let response = send_task(process, Request::ExpandMacro(Box::new(task)))?;
+    let response = {
+        let _p = tracing::info_span!("proc_macro::send_task").entered();
+        send_task(process, Request::ExpandMacro(Box::new(task)))?
+    };
 
+    let _p = tracing::info_span!("proc_macro::deserialize_response").entered();
     match response {
         Response::ExpandMacro(it) => Ok(it
             .map(|tree| {

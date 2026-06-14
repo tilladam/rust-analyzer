@@ -10,13 +10,13 @@
 //! in release mode in VS Code. There's however "rust-analyzer: Copy Run Command Line"
 //! which you can use to paste the command in terminal and add `--release` manually.
 
-use hir::ChangeWithProcMacros;
+use hir::{ChangeWithProcMacros, Semantics};
 use ide::{
     AnalysisHost, CallableSnippets, CompletionConfig, CompletionFieldsToResolve, DiagnosticsConfig,
     FilePosition, RaFixtureConfig, TextSize,
 };
 use ide_db::{
-    SnippetCap,
+    RootDatabase, SnippetCap,
     imports::insert_use::{ImportGranularity, InsertUseConfig},
 };
 use project_model::CargoConfig;
@@ -306,6 +306,112 @@ fn integrated_diagnostics_benchmark() {
             .full_diagnostics(&diagnostics_config, ide::AssistResolveStrategy::None, file_id)
             .unwrap();
     }
+}
+
+/// Harness for profiling `slint!` (or any function-like proc-macro) expansion in isolation.
+///
+/// Loads a real cargo project, locates the proc-macro call in a file, and times its
+/// expansion both cold (server spin-up + first expand) and warm (re-expand after editing
+/// the macro body, which is what we actually want to profile).
+///
+/// Run with, e.g.:
+/// ```bash
+/// SLINT_TESTCASE=$HOME/Code/slint-ra-testcases/crates/size_xlarge \
+///   RUN_SLOW_BENCHES=1 cargo test --release -p rust-analyzer \
+///   integrated_slint_macro_expansion_benchmark -- --nocapture --exact
+/// ```
+/// Defaults to `~/Code/slint-ra-testcases/crates/size_xlarge` and `src/lib.rs` if the
+/// `SLINT_TESTCASE` / `SLINT_TESTCASE_FILE` env vars are unset.
+#[test]
+fn integrated_slint_macro_expansion_benchmark() {
+    if std::env::var("RUN_SLOW_BENCHES").is_err() {
+        return;
+    }
+
+    let project = std::env::var("SLINT_TESTCASE").unwrap_or_else(|_| {
+        format!("{}/Code/slint-ra-testcases/crates/size_xlarge", std::env::var("HOME").unwrap())
+    });
+    let rel_file = std::env::var("SLINT_TESTCASE_FILE").unwrap_or_else(|_| "src/lib.rs".to_owned());
+    let workspace_to_load = AbsPathBuf::assert_utf8(std::path::PathBuf::from(project));
+
+    let cargo_config = CargoConfig {
+        sysroot: Some(project_model::RustLibSource::Discover),
+        all_targets: true,
+        set_test: true,
+        ..CargoConfig::default()
+    };
+    let load_cargo_config = LoadCargoConfig {
+        load_out_dirs_from_check: true,
+        with_proc_macro_server: ProcMacroServerChoice::Sysroot,
+        prefill_caches: false,
+        num_worker_threads: 1,
+        proc_macro_processes: 1,
+    };
+
+    let (db, vfs, _proc_macro) = {
+        let _it = stdx::timeit("workspace loading");
+        load_workspace_at(workspace_to_load.as_ref(), &cargo_config, &load_cargo_config, &|_| {})
+            .unwrap()
+    };
+    let mut host = AnalysisHost::with_database(db);
+
+    let file_id = {
+        let path = VfsPath::from(workspace_to_load.join(&rel_file));
+        file_id(&vfs, &path)
+    };
+
+    // Cold expansion: includes proc-macro server spin-up and the very first expand of the
+    // macro. This is the cost paid once when a file is first opened.
+    {
+        let _it = stdx::timeit("cold expand");
+        let count = expand_proc_macros_in(host.raw_database(), file_id);
+        eprintln!("expanded {count} proc-macro call(s)");
+        assert!(count > 0, "no proc-macro calls found in {rel_file}; is the testcase built?");
+    }
+
+    // Invalidate the macro: edit a byte inside the macro body so salsa must re-expand it.
+    // This is the steady-state cost we care about (typing inside / near the macro).
+    {
+        let _it = stdx::timeit("apply edit");
+        let mut text = host.analysis().file_text(file_id).unwrap().to_string();
+        // Insert a harmless whitespace token inside the first `{` of the macro invocation.
+        let brace = text.find('{').expect("no `{` in file");
+        text.insert(brace + 1, ' ');
+        let mut change = ChangeWithProcMacros::default();
+        change.change_file(file_id, Some(text));
+        host.apply_change(change);
+    }
+
+    let _g = crate::tracing::hprof::init("*");
+
+    // Warm expansion: the profiled run. The proc-macro server is already up, so this
+    // isolates per-expansion cost (serialize -> IPC + slint codegen -> deserialize -> reparse).
+    {
+        let _p = tracing::info_span!("slint macro expansion").entered();
+        let _it = stdx::timeit("warm expand");
+        let _span = profile::cpu_span();
+        let count = expand_proc_macros_in(host.raw_database(), file_id);
+        eprintln!("re-expanded {count} proc-macro call(s)");
+    }
+}
+
+/// Forces expansion of every function-like proc-macro call in `file_id` and returns how
+/// many were expanded. Walking the expansion drives `expand_proc_macro` +
+/// `token_tree_to_syntax_node`, which carry the profiling spans.
+fn expand_proc_macros_in(db: &RootDatabase, file_id: vfs::FileId) -> usize {
+    use syntax::{AstNode, ast};
+
+    let sema = Semantics::new(db);
+    let source_file = sema.parse_guess_edition(file_id);
+    let mut count = 0;
+    for macro_call in source_file.syntax().descendants().filter_map(ast::MacroCall::cast) {
+        if let Some(expanded) = sema.expand_macro_call(&macro_call) {
+            // Touch the whole expansion so lazy work isn't skipped.
+            let _ = expanded.value.descendants().count();
+            count += 1;
+        }
+    }
+    count
 }
 
 fn patch(what: &mut String, from: &str, to: &str) -> usize {
